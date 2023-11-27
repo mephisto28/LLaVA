@@ -48,6 +48,97 @@ def load_images(image_files):
     return out
 
 
+class LLaVAPredictor:
+    def __init__(self, model_path='liuhaotian/llava-v1.5-7b'):
+        import os
+        os.environ['HOME'] = '/mnt/synology2/'
+        self.model_path = model_path
+        self.model_name = get_model_name_from_path(model_path)
+        self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+            self.model_path, None, self.model_name
+        )
+        self.conv_mode = None
+        self.sep = ','
+    
+    def generate(self, image, query, temperature=0.2, top_p=None, num_beams=1, max_new_tokens=512):
+        model_name, model, tokenizer, image_processor, context_len, conv_mode = \
+            self.model_name, self.model, self.tokenizer, self.image_processor, self.context_len, self.conv_mode
+        qs = query
+        image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+        if IMAGE_PLACEHOLDER in qs:
+            if model.config.mm_use_im_start_end:
+                qs = re.sub(IMAGE_PLACEHOLDER, image_token_se, qs)
+            else:
+                qs = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, qs)
+        else:
+            if model.config.mm_use_im_start_end:
+                qs = image_token_se + "\n" + qs
+            else:
+                qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
+
+        if "llama-2" in model_name.lower():
+            conv_mode = "llava_llama_2"
+        elif "v1" in model_name.lower():
+            conv_mode = "llava_v1"
+        elif "mpt" in model_name.lower():
+            conv_mode = "mpt"
+        else:
+            conv_mode = "llava_v0"
+
+        conv = conv_templates[conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        if not isinstance(image, list):
+            images = [image]
+        
+        images = images if isinstance(images[0], Image.Image) else [Image.fromarray(image[..., ::-1]) for image in images]
+        images_tensor = process_images(
+            images,
+            image_processor,
+            model.config
+        ).to(model.device, dtype=torch.float16)
+
+        input_ids = (
+            tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+            .unsqueeze(0)
+            .cuda()
+        )
+
+        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        keywords = [stop_str]
+        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=images_tensor,
+                do_sample=True if temperature > 0 else False,
+                temperature=temperature,
+                top_p=top_p,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+                stopping_criteria=[stopping_criteria],
+            )
+
+        input_token_len = input_ids.shape[1]
+        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+        if n_diff_input_output > 0:
+            print(
+                f"[Warning] {n_diff_input_output} output_ids are not the same as the input_ids"
+            )
+        outputs = tokenizer.batch_decode(
+            output_ids[:, input_token_len:], skip_special_tokens=True
+        )[0]
+        outputs = outputs.strip()
+        if outputs.endswith(stop_str):
+            outputs = outputs[: -len(stop_str)]
+        outputs = outputs.strip()
+        return outputs
+
+
 def eval_model(args):
     # Model
     disable_torch_init()
